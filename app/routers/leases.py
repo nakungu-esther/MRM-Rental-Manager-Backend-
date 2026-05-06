@@ -1,0 +1,186 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.database import get_db
+from app.dependencies import get_current_user, require_roles
+from app.models.user import User
+from app.models.lease import Lease, LeaseStatus
+from app.models.tenant import Tenant
+from app.models.property import Unit, UnitStatus
+from app.schemas.lease import LeaseCreate, LeaseUpdate, LeaseTerminate, LeaseOut
+from app.utils.response import success_response, error_response
+
+router = APIRouter(prefix="/leases", tags=["Leases"])
+
+
+def get_unit_lease_status(db: Session, unit_id: int):
+    """Check if unit has an active lease."""
+    return db.query(Lease).filter(
+        Lease.unit_id == unit_id,
+        Lease.status == LeaseStatus.active
+    ).first()
+
+
+@router.post("/", status_code=201)
+def create_lease(
+    payload: LeaseCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin", "staff", "landlord"])),
+):
+    """Create lease with standardized response"""
+    # Verify tenant exists and belongs to user
+    tenant = db.query(Tenant).filter(
+        Tenant.id == payload.tenant_id,
+        Tenant.owner_id == current_user.id
+    ).first()
+    if not tenant:
+        raise error_response("Tenant not found or access denied.", status_code=404)
+
+    # Verify unit exists and belongs to user
+    unit = db.query(Unit).filter(
+        Unit.id == payload.unit_id,
+        Unit.parent_property.has(owner_id=current_user.id)
+    ).first()
+    if not unit:
+        raise error_response("Unit not found or access denied.", status_code=404)
+
+    # Check unit is not already occupied by active lease
+    existing = get_unit_lease_status(db, payload.unit_id)
+    if existing:
+        raise error_response("Unit already has an active lease.", status_code=409)
+
+    lease = Lease(
+        tenant_id=payload.tenant_id,
+        unit_id=payload.unit_id,
+        owner_id=current_user.id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        monthly_rent=payload.monthly_rent,
+        deposit_amount=payload.deposit_amount or 0,
+        status=LeaseStatus.active,
+        notes=payload.notes,
+    )
+
+    unit.status = UnitStatus.occupied
+    db.add(lease)
+    db.commit()
+    db.refresh(lease)
+    return success_response(data={"id": lease.id, "status": lease.status.value}, message="Lease created successfully")
+
+
+@router.get("/")
+def list_leases(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: int = None,
+    unit_id: int = None,
+    status: str = None,
+):
+    """List leases. Admin/Staff see all for their properties. Tenants see only their own."""
+    q = db.query(Lease)
+
+    if current_user.role == "tenant":
+        # Tenant sees only leases linked through their tenant profile
+        tenant = db.query(Tenant).filter(Tenant.user_id == current_user.id).first()
+        if not tenant:
+            return success_response(data=[])
+        q = q.filter(Lease.tenant_id == tenant.id)
+    elif current_user.role in ("landlord", "staff"):
+        q = q.filter(Lease.owner_id == current_user.id)
+    # Admin sees all
+
+    if tenant_id:
+        q = q.filter(Lease.tenant_id == tenant_id)
+    if unit_id:
+        q = q.filter(Lease.unit_id == unit_id)
+    if status:
+        q = q.filter(Lease.status == status)
+
+    leases = q.order_by(Lease.created_at.desc()).all()
+    return success_response(data=leases)
+
+
+@router.get("/{lease_id}")
+def get_lease(
+    lease_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get single lease with standardized response"""
+    lease = db.query(Lease).filter(Lease.id == lease_id).first()
+    if not lease:
+        raise error_response("Lease not found.", status_code=404)
+
+    # Permission check
+    if current_user.role == "tenant":
+        tenant = db.query(Tenant).filter(Tenant.user_id == current_user.id).first()
+        if not tenant or lease.tenant_id != tenant.id:
+            raise error_response("Access denied.", status_code=403)
+    elif current_user.role in ("landlord", "staff") and lease.owner_id != current_user.id:
+        raise error_response("Access denied.", status_code=403)
+
+    return success_response(data=lease)
+
+
+@router.put("/{lease_id}")
+def update_lease(
+    lease_id: int,
+    payload: LeaseUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin", "staff", "landlord"])),
+):
+    """Update lease with standardized response"""
+    lease = db.query(Lease).filter(
+        Lease.id == lease_id,
+        Lease.owner_id == current_user.id
+    ).first()
+    if not lease:
+        raise error_response("Lease not found or access denied.", status_code=404)
+
+    if lease.status != LeaseStatus.active:
+        raise error_response("Can only update active leases.", status_code=409)
+
+    if payload.end_date is not None:
+        lease.end_date = payload.end_date
+    if payload.monthly_rent is not None:
+        lease.monthly_rent = payload.monthly_rent
+    if payload.deposit_amount is not None:
+        lease.deposit_amount = payload.deposit_amount
+    if payload.notes is not None:
+        lease.notes = payload.notes
+
+    db.commit()
+    db.refresh(lease)
+    return success_response(data=lease, message="Lease updated successfully")
+
+
+@router.post("/{lease_id}/terminate")
+def terminate_lease(
+    lease_id: int,
+    payload: LeaseTerminate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(["admin", "staff", "landlord"])),
+):
+    """Terminate lease with standardized response"""
+    lease = db.query(Lease).filter(
+        Lease.id == lease_id,
+        Lease.owner_id == current_user.id
+    ).first()
+    if not lease:
+        raise error_response("Lease not found or access denied.", status_code=404)
+
+    if lease.status != LeaseStatus.active:
+        raise error_response("Lease is not active.", status_code=409)
+
+    lease.status = LeaseStatus.terminated
+    lease.termination_date = payload.termination_date
+    lease.termination_reason = payload.termination_reason
+
+    # Free up the unit
+    if lease.unit:
+        lease.unit.status = UnitStatus.vacant
+
+    db.commit()
+    db.refresh(lease)
+    return success_response(data=lease, message="Lease terminated successfully")

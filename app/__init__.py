@@ -1,0 +1,2 @@
+"""RentalMGR backend application package."""
+
