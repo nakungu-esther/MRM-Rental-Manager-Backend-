@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import asyncio
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,29 +34,21 @@ for sub in ["properties", "tenants", "receipts", "receipts/proofs", "maintenance
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
-    import logging
-
-    from app.config import settings
+async def lifespan(app: FastAPI):
     from app.services.gateway.config import gateway_public_status, is_gateway_configured
-    from app.utils.init_db import (
-        ensure_government_schema_migrations,
-    ensure_government_invitation_tables,
-        ensure_payment_checkout_table,
-        ensure_payments_column_migrations,
-        ensure_tenants_column_migrations,
-        ensure_users_column_migrations,
-    )
+    from app.utils.init_db import run_startup_migrations
 
-    ensure_users_column_migrations()
-    ensure_tenants_column_migrations()
-    ensure_payments_column_migrations()
-    ensure_payment_checkout_table()
-    ensure_government_schema_migrations()
-    ensure_government_invitation_tables()
+    log = logging.getLogger("uvicorn.error")
+
+    async def _background_migrations() -> None:
+        try:
+            await asyncio.to_thread(run_startup_migrations)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Background startup migrations failed: %s", exc)
+
+    migration_task = asyncio.create_task(_background_migrations())
 
     gw = gateway_public_status()
-    log = logging.getLogger("uvicorn.error")
     if settings.environment == "production" and not is_gateway_configured():
         log.error(
             "PAYMENTS: gateway not configured — set MTN MoMo or Pesapal keys (see docs/PAYMENT_GATEWAY.md)."
@@ -68,7 +62,14 @@ async def lifespan(_app: FastAPI):
             gw.get("mode"),
         )
 
+    # Accept HTTP immediately; migrations run in background (avoids reload timeouts).
     yield
+
+    migration_task.cancel()
+    try:
+        await migration_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

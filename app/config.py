@@ -5,6 +5,8 @@ from typing import List
 class Settings(BaseSettings):
     # Environment
     environment: str = "development"
+    # Skip DB migration checks on API boot (faster reload; run python -m app.utils.init_db when schema changes)
+    skip_startup_migrations: bool = False
 
     # Database — Neon / Postgres (set DATABASE_URL in .env)
     # Example: postgresql+psycopg2://USER:PASSWORD@ep-xxx.region.aws.neon.tech/neondb?sslmode=require
