@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
 
-from app.config import settings
+from app.config import database_url_looks_configured, settings
 from app.runtime import is_serverless, upload_root
 from app.routers import (
     auth,
@@ -150,4 +150,35 @@ def root():
 
 @app.get("/health", tags=["Health"])
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "database_configured": database_url_looks_configured(),
+    }
+
+
+@app.get("/health/db", tags=["Health"])
+def health_db():
+    """Verify Postgres/Neon connectivity (use after setting DATABASE_URL on Vercel)."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.config import database_url_looks_configured
+    from app.database import engine
+
+    if not database_url_looks_configured():
+        return {
+            "status": "error",
+            "database": "not_configured",
+            "hint": "Set DATABASE_URL on Vercel (postgresql+psycopg2://...neon.tech/...?sslmode=require)",
+        }
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "connected"}
+    except SQLAlchemyError as exc:
+        return {
+            "status": "error",
+            "database": "connection_failed",
+            "detail": str(exc)[:240],
+        }

@@ -93,6 +93,18 @@ class Settings(BaseSettings):
             return [part.strip() for part in value.split(",") if part.strip()]
         return value
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value):
+        if not value or not isinstance(value, str):
+            return value
+        url = value.strip()
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg2://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://") and "+psycopg2" not in url:
+            url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+        return url
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -100,3 +112,15 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def database_url_looks_configured() -> bool:
+    """False when still on the placeholder from config defaults."""
+    url = (settings.database_url or "").lower()
+    if not url:
+        return False
+    if "user:password@localhost" in url:
+        return False
+    if url.endswith("/rental_manager_db") and "localhost" in url:
+        return False
+    return True
