@@ -80,6 +80,19 @@ class Settings(BaseSettings):
     flutterwave_secret_key: str = ""
     flutterwave_public_key: str = ""
 
+    # Sui blockchain — hybrid Web3 (does not replace MoMo/Pesapal)
+    sui_network: str = "devnet"
+    sui_rpc_url: str = ""
+    sui_treasury_address: str = ""
+    sui_package_id: str = ""
+    sui_escrow_module: str = "escrow"
+    sui_ugx_per_sui: float = 6_000_000
+    sui_anchor_fiat_receipts: bool = True
+
+    # Walrus decentralized storage
+    walrus_publisher_url: str = ""
+    walrus_aggregator_url: str = ""
+
     # Transactional email branding (optional logo: public HTTPS URL, e.g. CDN or your SPA /logo.png)
     email_brand_name: str = "RentDirect UG"
     email_product_tagline: str = "Property rentals · Uganda"
@@ -93,6 +106,18 @@ class Settings(BaseSettings):
             return [part.strip() for part in value.split(",") if part.strip()]
         return value
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value):
+        if not value or not isinstance(value, str):
+            return value
+        url = value.strip()
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg2://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://") and "+psycopg2" not in url:
+            url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+        return url
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -100,3 +125,15 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def database_url_looks_configured() -> bool:
+    """False when still on the placeholder from config defaults."""
+    url = (settings.database_url or "").lower()
+    if not url:
+        return False
+    if "user:password@localhost" in url:
+        return False
+    if url.endswith("/rental_manager_db") and "localhost" in url:
+        return False
+    return True
