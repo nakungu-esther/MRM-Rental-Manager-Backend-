@@ -505,6 +505,8 @@ def nira_decide(
     if decision == "approved":
         user.kyc_review_status = "approved"
         user.trusted_for_commerce = user.role in (UserRole.landlord, UserRole.staff)
+        if not user.kyc_submitted_at:
+            user.kyc_submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     elif decision == "rejected":
         user.kyc_review_status = "rejected"
         user.trusted_for_commerce = False

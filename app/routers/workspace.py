@@ -117,8 +117,12 @@ def admin_kyc_review(
         raise HTTPException(status_code=400, detail="KYC moderation applies to landlords and agents only.")
     act = (body.action or "").strip().lower()
     if act == "approve":
+        from datetime import datetime
+
         user.kyc_review_status = "approved"
         user.trusted_for_commerce = True
+        if not user.kyc_submitted_at:
+            user.kyc_submitted_at = datetime.utcnow()
     elif act == "reject":
         user.kyc_review_status = "rejected"
         user.trusted_for_commerce = False
