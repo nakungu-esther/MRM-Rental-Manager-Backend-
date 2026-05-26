@@ -15,6 +15,7 @@ from app.services.workspace_service import (
     admin_list_users,
     admin_summary,
     admin_user_account_action,
+    admin_delete_user,
     staff_summary,
 )
 from app.schemas.agent_crm import (
@@ -103,6 +104,16 @@ def admin_user_account(
     return success_response(data=data, message=data.get("message"))
 
 
+@router.delete("/admin/users/{user_id}", summary="Permanently delete a platform account")
+def admin_user_delete(
+    user_id: int,
+    db: Session = Depends(get_db),
+    actor: User = Depends(require_system_admin),
+):
+    data = admin_delete_user(db, actor_id=actor.id, target_user_id=user_id)
+    return success_response(data=data, message=data.get("message"))
+
+
 @router.patch("/admin/users/{user_id}/kyc-review", summary="Approve or reject landlord/agent KYC")
 def admin_kyc_review(
     user_id: int,
@@ -117,8 +128,12 @@ def admin_kyc_review(
         raise HTTPException(status_code=400, detail="KYC moderation applies to landlords and agents only.")
     act = (body.action or "").strip().lower()
     if act == "approve":
+        from datetime import datetime
+
         user.kyc_review_status = "approved"
         user.trusted_for_commerce = True
+        if not user.kyc_submitted_at:
+            user.kyc_submitted_at = datetime.utcnow()
     elif act == "reject":
         user.kyc_review_status = "rejected"
         user.trusted_for_commerce = False

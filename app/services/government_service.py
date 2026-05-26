@@ -323,7 +323,7 @@ def overview_summary(db: Session, *, agency: str = "all") -> dict[str, Any]:
     if gov_col is not None:
         verified_properties = (
             db.query(func.count(Property.id))
-            .filter(Property.is_active == True, gov_col == "verified")
+            .filter(gov_col == "verified")
             .scalar()
             or 0
         )
@@ -333,11 +333,18 @@ def overview_summary(db: Session, *, agency: str = "all") -> dict[str, Any]:
             .scalar()
             or 0
         )
+        flagged_properties = (
+            db.query(func.count(Property.id))
+            .filter(gov_col.in_(["rejected", "illegal"]))
+            .scalar()
+            or 0
+        )
     else:
         verified_properties = (
             db.query(func.count(Property.id)).filter(Property.is_active == True).scalar() or 0
         )
         pending_properties = max(0, int(properties_total) - int(verified_properties))
+        flagged_properties = 0
 
     today = date.today()
     tax_filters = [_payment_not_deleted(), _rent_payment_type_filter()]
@@ -382,6 +389,8 @@ def overview_summary(db: Session, *, agency: str = "all") -> dict[str, Any]:
         "pending_kyc": int(pending_kyc),
         "flagged_accounts": int(flagged),
         "verified_properties": int(verified_properties),
+        "properties_total": int(properties_total),
+        "flagged_properties": int(flagged_properties),
         "tax_revenue_ugx": float(tax_revenue),
         "fraud_cases": int(flagged),
         "pending_inspections": int(pending_properties),
@@ -406,7 +415,7 @@ def overview_summary(db: Session, *, agency: str = "all") -> dict[str, Any]:
             {"name": "Pending", "value": int(pending_properties), "color": "#F59E0B"},
             {
                 "name": "Rejected / Illegal",
-                "value": max(0, int(properties_total) - int(verified_properties) - int(pending_properties)),
+                "value": int(flagged_properties),
                 "color": "#EF4444",
             },
         ]
@@ -459,13 +468,26 @@ def nira_queue(
         .limit(min(limit, 200))
         .all()
     )
+    from app.services import verification_service
+    from app.services.verification_service import verify_page_url
+
     out = []
+    tokens_dirty = False
     for u in rows:
         risk = "low"
         if u.kyc_review_status == "rejected":
             risk = "high"
         elif u.kyc_review_status == "pending":
             risk = "medium"
+        compliance_token = None
+        compliance_url = None
+        if (u.kyc_review_status or "").lower() == "approved":
+            if not getattr(u, "compliance_verify_token", None):
+                verification_service.ensure_compliance_verify_token(u)
+                tokens_dirty = True
+            compliance_token = getattr(u, "compliance_verify_token", None)
+            if compliance_token:
+                compliance_url = verify_page_url(compliance_token)
         out.append(
             {
                 "user_id": u.id,
@@ -477,10 +499,17 @@ def nira_queue(
                 "face_match_pct": _kyc_face_match_pct(u),
                 "fraud_risk": risk,
                 "submitted_at": u.kyc_submitted_at.isoformat() if u.kyc_submitted_at else None,
-                **walrus_anchor_service.proof_fields(getattr(u, "kyc_walrus_blob_id", None)),
+                "compliance_verify_token": compliance_token,
+                "verification_url": compliance_url,
+                **walrus_anchor_service.proof_fields(
+                    getattr(u, "kyc_walrus_blob_id", None),
+                    content_hash=getattr(u, "kyc_manifest_hash", None),
+                ),
                 "kyc_manifest_hash": getattr(u, "kyc_manifest_hash", None),
             }
         )
+    if tokens_dirty:
+        db.commit()
     return {
         "items": out,
         "pending_in_database": _pending_kyc_count(db),
@@ -505,6 +534,8 @@ def nira_decide(
     if decision == "approved":
         user.kyc_review_status = "approved"
         user.trusted_for_commerce = user.role in (UserRole.landlord, UserRole.staff)
+        if not user.kyc_submitted_at:
+            user.kyc_submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     elif decision == "rejected":
         user.kyc_review_status = "rejected"
         user.trusted_for_commerce = False
@@ -527,12 +558,61 @@ def nira_decide(
         decision=decision,
         note=note,
     )
+    if decision == "approved":
+        from app.services import verification_service
+
+        verification_service.ensure_compliance_verify_token(user)
     db.commit()
     db.refresh(user)
-    return {
+    out = {
         "user_id": user.id,
         "kyc_review_status": user.kyc_review_status,
         **walrus_anchor_service.proof_fields(user.kyc_walrus_blob_id),
+    }
+    if getattr(user, "compliance_verify_token", None):
+        from app.services.verification_service import verify_page_url
+
+        out["verification_url"] = verify_page_url(user.compliance_verify_token)
+    return out
+
+
+def kcca_property_stats(db: Session) -> dict[str, Any]:
+    """Live KCCA property counts for dashboard cards (not filtered by tab)."""
+    gov_col = _property_gov_status_column()
+    total = db.query(func.count(Property.id)).scalar() or 0
+    if gov_col is None:
+        return {
+            "total": int(total),
+            "verified": 0,
+            "pending": int(total),
+            "inspection": 0,
+            "flagged": 0,
+            "inspection_districts": 0,
+        }
+
+    verified = db.query(func.count(Property.id)).filter(gov_col == "verified").scalar() or 0
+    pending = db.query(func.count(Property.id)).filter(gov_col == "pending").scalar() or 0
+    inspection = db.query(func.count(Property.id)).filter(gov_col == "inspection").scalar() or 0
+    flagged = (
+        db.query(func.count(Property.id)).filter(gov_col.in_(["rejected", "illegal"])).scalar() or 0
+    )
+    inspection_districts = (
+        db.query(func.count(func.distinct(Property.district)))
+        .filter(
+            gov_col == "inspection",
+            Property.district.isnot(None),
+            Property.district != "",
+        )
+        .scalar()
+        or 0
+    )
+    return {
+        "total": int(total),
+        "verified": int(verified),
+        "pending": int(pending),
+        "inspection": int(inspection),
+        "flagged": int(flagged),
+        "inspection_districts": int(inspection_districts),
     }
 
 
@@ -555,7 +635,10 @@ def kcca_properties(db: Session, *, status: Optional[str] = None, limit: int = 5
                 "status": getattr(p, "gov_verification_status", None) or "pending",
                 "is_published": bool(p.is_active),
                 "submitted_at": p.created_at.isoformat() if p.created_at else None,
-                **walrus_anchor_service.proof_fields(getattr(p, "gov_walrus_blob_id", None)),
+                **walrus_anchor_service.proof_fields(
+                    getattr(p, "gov_walrus_blob_id", None),
+                    content_hash=getattr(p, "gov_packet_hash", None),
+                ),
                 "gov_packet_hash": getattr(p, "gov_packet_hash", None),
             }
         )
@@ -589,6 +672,9 @@ def kcca_decide(
         table_name="properties",
         record_id=property_id,
     )
+    from app.services import verification_service
+
+    verification_service.ensure_property_verify_token(prop)
     walrus_anchor_service.anchor_property_decision(
         db,
         prop,
@@ -598,11 +684,18 @@ def kcca_decide(
     )
     db.commit()
     db.refresh(prop)
-    return {
+    from app.services.verification_service import verify_page_url
+
+    ret = {
         "property_id": prop.id,
         "gov_verification_status": prop.gov_verification_status,
-        **walrus_anchor_service.proof_fields(prop.gov_walrus_blob_id),
+        **walrus_anchor_service.proof_fields(
+            prop.gov_walrus_blob_id,
+            content_hash=getattr(prop, "gov_packet_hash", None),
+        ),
+        "verification_url": verify_page_url(prop.verification_token) if prop.verification_token else None,
     }
+    return ret
 
 
 def ura_rental_reports(db: Session, *, limit: int = 50) -> list[dict]:
