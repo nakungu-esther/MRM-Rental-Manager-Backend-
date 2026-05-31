@@ -11,6 +11,7 @@ from app.models.conversation import Message, MessageKind, MessageThread, ThreadP
 from app.models.property import Property, Unit
 from app.models.user import User
 from app.services.media_storage_service import save_media
+from app.services.notification_service import create_notification
 from app.services.trust_service import compute_trust_score, peer_profile, user_badges
 
 
@@ -22,6 +23,54 @@ def _thread_type_value(t: MessageThread) -> str:
     if t.thread_type is None:
         return ThreadType.inquiry.value
     return t.thread_type.value if hasattr(t.thread_type, "value") else str(t.thread_type)
+
+
+def _messages_link_for_user(user: User, thread_id: int) -> str:
+    role = user.role.value if hasattr(user.role, "value") else str(user.role)
+    base = {
+        "tenant": "/tenant/messages",
+        "landlord": "/landlord/messages",
+        "staff": "/agent/messages",
+    }.get(role, "/landlord/messages")
+    return f"{base}?thread={thread_id}"
+
+
+def _notify_message_recipients(
+    db: Session,
+    thread: MessageThread,
+    sender_id: int,
+    body: str,
+    *,
+    attachment_name: Optional[str] = None,
+) -> None:
+    sender = db.query(User).filter(User.id == sender_id).first()
+    sender_name = (sender.full_name or sender.email or "Someone").strip() if sender else "Someone"
+
+    preview = (body or "").strip()
+    if attachment_name and not preview:
+        preview = f"Sent an attachment: {attachment_name}"
+    elif attachment_name:
+        preview = f"{preview} 📎"
+    if len(preview) > 120:
+        preview = preview[:117] + "…"
+
+    thread_label = thread.listing_title or thread.subject or "Rental Hub"
+    title = f"New message from {sender_name}"
+
+    for uid in _participant_ids(thread):
+        if uid == sender_id:
+            continue
+        recipient = db.query(User).filter(User.id == uid).first()
+        if not recipient:
+            continue
+        create_notification(
+            db,
+            user_id=uid,
+            title=title,
+            message=f"{thread_label}: {preview or 'New message'}",
+            notif_type="general",
+            link=_messages_link_for_user(recipient, thread.id),
+        )
 
 
 def find_thread_for_pair_and_unit(db: Session, a: int, b: int, unit_id: Optional[int]) -> Optional[MessageThread]:
@@ -109,6 +158,14 @@ def append_message(
     thread.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(m)
+    if message_kind == MessageKind.user and sender_id is not None:
+        _notify_message_recipients(
+            db,
+            thread,
+            sender_id,
+            body.strip(),
+            attachment_name=attachment_name,
+        )
     return m
 
 
@@ -399,3 +456,80 @@ def save_attachment(upload_dir: str, thread_id: int, filename: str, content: byt
         filename=safe,
         upload_dir=upload_dir,
     )
+
+
+def start_call_session(
+    db: Session,
+    thread_id: int,
+    user_id: int,
+    *,
+    mode: str = "video",
+) -> dict[str, Any] | None:
+    """Create a Jitsi Meet room and log a system message in the thread."""
+    import secrets
+
+    thread = (
+        db.query(MessageThread)
+        .options(joinedload(MessageThread.participants))
+        .filter(MessageThread.id == thread_id)
+        .first()
+    )
+    if not thread or user_id not in _participant_ids(thread):
+        return None
+    room = f"rentdirect-{thread_id}-{secrets.token_hex(4)}"
+    base = f"https://meet.jit.si/{room}"
+    if mode == "voice":
+        room_url = f"{base}#config.startWithVideoMuted=true&config.startAudioOnly=true"
+        label = "Voice call"
+    else:
+        room_url = base
+        label = "Video call"
+    user = db.query(User).filter(User.id == user_id).first()
+    name = (user.full_name if user else "Participant").replace(" ", "%20")
+    join_url = f"{room_url}#userInfo.displayName={name}"
+    post_system_message(
+        db,
+        thread_id,
+        "call_started",
+        f"{label} room ready. Join: {join_url}",
+    )
+    return {"mode": mode, "room_name": room, "join_url": join_url}
+
+
+def list_threads_admin(db: Session, *, limit: int = 100) -> List[dict[str, Any]]:
+    rows = (
+        db.query(MessageThread)
+        .options(joinedload(MessageThread.participants), joinedload(MessageThread.messages))
+        .order_by(MessageThread.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+    out: List[dict[str, Any]] = []
+    for t in rows:
+        tt = _thread_type_value(t)
+        last = ""
+        if t.messages:
+            lm = max(t.messages, key=lambda m: m.created_at or datetime.min)
+            last = (lm.body or "")[:100]
+        participant_ids = [p.user_id for p in t.participants]
+        users = db.query(User).filter(User.id.in_(participant_ids)).all() if participant_ids else []
+        out.append(
+            {
+                "id": t.id,
+                "thread_type": tt,
+                "subject": t.subject or t.listing_title,
+                "participants": [
+                    {
+                        "id": u.id,
+                        "name": u.full_name,
+                        "email": u.email,
+                        "role": u.role.value if hasattr(u.role, "value") else str(u.role),
+                    }
+                    for u in users
+                ],
+                "last_message": last,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                "archived": t.archived_at is not None,
+            }
+        )
+    return out
